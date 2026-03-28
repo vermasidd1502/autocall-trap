@@ -540,12 +540,258 @@ def process_url(url: str, output_file: str) -> Optional[ExtractedNote]:
     return note
 
 
+# ── EFTS Bulk Search ─────────────────────────────────────────────
+
+def search_edgar_efts(
+    query: str = '"autocall" OR "auto-call" OR "automatic call"',
+    form_type: str = "424B2",
+    date_from: str = "2018-01-01",
+    date_to: str = "2025-12-31",
+    max_results: int = 500,
+) -> List[str]:
+    """
+    Search EDGAR full-text search (EFTS) API for 424B2 filings
+    containing autocallable keywords. Returns a list of filing URLs.
+
+    The EFTS API endpoint is:
+        https://efts.sec.gov/LATEST/search-index?q=...&forms=...
+
+    Parameters
+    ----------
+    query : str
+        Full-text search query. Supports boolean operators.
+    form_type : str
+        SEC form type to filter (default: 424B2).
+    date_from, date_to : str
+        Date range for filings (YYYY-MM-DD).
+    max_results : int
+        Maximum number of filing URLs to return.
+
+    Returns
+    -------
+    List[str]
+        List of EDGAR filing URLs.
+    """
+    base_url = "https://efts.sec.gov/LATEST/search-index"
+    urls = []
+    start = 0
+    batch_size = 50  # EFTS returns up to 50 per page
+
+    print(f"\n  EDGAR EFTS Search")
+    print(f"  Query: {query}")
+    print(f"  Form type: {form_type}")
+    print(f"  Date range: {date_from} to {date_to}")
+    print(f"  Max results: {max_results}")
+
+    while len(urls) < max_results:
+        params = {
+            "q": query,
+            "dateRange": "custom",
+            "startdt": date_from,
+            "enddt": date_to,
+            "forms": form_type,
+            "from": start,
+        }
+        try:
+            resp = requests.get(base_url, params=params, headers=HEADERS, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            print(f"  EFTS API error: {e}")
+            # Fallback: try the public search endpoint
+            break
+
+        hits = data.get("hits", {}).get("hits", [])
+        if not hits:
+            break
+
+        for hit in hits:
+            # Extract the filing URL from the EFTS result
+            file_path = hit.get("_source", {}).get("file_path", "")
+            if file_path:
+                filing_url = f"https://www.sec.gov/Archives/{file_path}"
+                urls.append(filing_url)
+
+            if len(urls) >= max_results:
+                break
+
+        total = data.get("hits", {}).get("total", {})
+        total_count = total.get("value", 0) if isinstance(total, dict) else total
+        print(f"  Fetched {len(urls)}/{min(total_count, max_results)} filings...")
+        start += batch_size
+        time.sleep(0.15)  # Rate limit: be nice to SEC servers
+
+    print(f"  Found {len(urls)} filing URLs")
+    return urls
+
+
+def search_edgar_fulltext(
+    query: str = '"autocallable" OR "auto-callable" OR "contingent coupon"',
+    form_type: str = "424B2",
+    date_from: str = "2018-01-01",
+    date_to: str = "2025-12-31",
+    max_results: int = 500,
+) -> List[str]:
+    """
+    Fallback search using EDGAR full-text search public endpoint.
+    Returns filing URLs for 424B2 filings matching the query.
+    """
+    base_url = "https://efts.sec.gov/LATEST/search-index"
+    # Also try the public EDGAR search
+    public_url = "https://efts.sec.gov/LATEST/search-index"
+
+    urls = []
+    start = 0
+
+    print(f"\n  EDGAR Full-Text Search (public endpoint)")
+    print(f"  Query: {query}")
+
+    while len(urls) < max_results:
+        params = {
+            "q": query,
+            "dateRange": "custom",
+            "startdt": date_from,
+            "enddt": date_to,
+            "forms": form_type,
+            "from": start,
+        }
+        try:
+            resp = requests.get(public_url, params=params, headers=HEADERS, timeout=30)
+            if resp.status_code != 200:
+                print(f"  HTTP {resp.status_code}. Trying alternative endpoint...")
+                break
+            data = resp.json()
+        except Exception as e:
+            print(f"  Error: {e}")
+            break
+
+        hits = data.get("hits", {}).get("hits", [])
+        if not hits:
+            break
+
+        for hit in hits:
+            source = hit.get("_source", {})
+            file_path = source.get("file_path", "")
+            if file_path:
+                urls.append(f"https://www.sec.gov/Archives/{file_path}")
+            if len(urls) >= max_results:
+                break
+
+        start += 50
+        time.sleep(0.15)
+
+    print(f"  Found {len(urls)} filing URLs")
+    return urls
+
+
+def bulk_extract(
+    date_from: str = "2018-01-01",
+    date_to: str = "2025-12-31",
+    max_filings: int = 500,
+    output_file: str = "term_sheets_bulk.csv",
+    skip_baskets: bool = True,
+):
+    """
+    End-to-end bulk extraction:
+    1. Search EDGAR for autocallable 424B2 filings
+    2. Fetch and parse each filing
+    3. Filter out worst-of baskets (optional)
+    4. Export all extracted notes to CSV
+
+    Parameters
+    ----------
+    date_from, date_to : str
+        Date range for filings.
+    max_filings : int
+        Maximum filings to process.
+    output_file : str
+        Output CSV path.
+    skip_baskets : bool
+        If True, skip worst-of basket notes.
+    """
+    print("=" * 60)
+    print("EDGAR BULK AUTOCALLABLE EXTRACTION")
+    print("=" * 60)
+
+    # Step 1: Discover filings
+    urls = search_edgar_efts(
+        query='"autocall" OR "auto-call" OR "contingent coupon"',
+        form_type="424B2",
+        date_from=date_from,
+        date_to=date_to,
+        max_results=max_filings,
+    )
+
+    if not urls:
+        print("  No filings found. Try broadening the search.")
+        return
+
+    # Step 2: Process each filing
+    extracted = 0
+    skipped = 0
+    errors = 0
+
+    for i, url in enumerate(urls):
+        print(f"\n[{i+1}/{len(urls)}]", end="")
+        try:
+            html = fetch_filing(url)
+            if not html:
+                errors += 1
+                continue
+
+            note = extract_term_sheet(html, url)
+            if not note:
+                skipped += 1
+                continue
+
+            # Skip baskets if requested
+            if skip_baskets and "basket" in (note.notes or "").lower():
+                skipped += 1
+                print(f"  SKIP (basket): {note.note_id}")
+                continue
+
+            # Skip low-confidence extractions
+            if note.confidence == "low":
+                skipped += 1
+                print(f"  SKIP (low confidence): {note.note_id}")
+                continue
+
+            append_to_csv(note, output_file)
+            extracted += 1
+            print(f"  OK: {note.note_id} — {note.issuer} / {note.underlying_ticker or note.underlying}")
+
+        except Exception as e:
+            print(f"  ERROR: {e}")
+            errors += 1
+
+        # Rate limit
+        time.sleep(0.2)
+
+    print(f"\n{'BULK EXTRACTION SUMMARY':=^60}")
+    print(f"  Filings processed: {len(urls)}")
+    print(f"  Notes extracted:   {extracted}")
+    print(f"  Skipped:           {skipped}")
+    print(f"  Errors:            {errors}")
+    print(f"  Output:            {output_file}")
+    print(f"\n  Next steps:")
+    print(f"  1. Fill in S0 values: open {output_file} and add initial stock prices")
+    print(f"  2. Run: python data_pipeline.py --enrich {output_file}")
+
+
 # ── Main ──────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description="EDGAR Autocallable Note Extractor")
     parser.add_argument("--url", type=str, help="Single filing URL")
     parser.add_argument("--batch", type=str, help="File with one URL per line")
+    parser.add_argument("--bulk", action="store_true",
+                        help="Bulk search EDGAR EFTS for autocallable 424B2 filings")
+    parser.add_argument("--from-date", type=str, default="2018-01-01",
+                        help="Start date for bulk search (YYYY-MM-DD)")
+    parser.add_argument("--to-date", type=str, default="2025-12-31",
+                        help="End date for bulk search (YYYY-MM-DD)")
+    parser.add_argument("--max-filings", type=int, default=500,
+                        help="Max filings to process in bulk mode")
     parser.add_argument("--output", type=str, default="term_sheets.csv", help="Output CSV")
     args = parser.parse_args()
 
@@ -553,7 +799,15 @@ def main():
     print("EDGAR AUTOCALLABLE NOTE EXTRACTOR")
     print("=" * 60)
 
-    if args.url:
+    if args.bulk:
+        bulk_extract(
+            date_from=args.from_date,
+            date_to=args.to_date,
+            max_filings=args.max_filings,
+            output_file=args.output,
+        )
+
+    elif args.url:
         process_url(args.url, args.output)
 
     elif args.batch:
@@ -567,7 +821,13 @@ def main():
 
     else:
         # Interactive mode
-        print("\nPaste EDGAR 424B2 URLs one at a time. Type 'done' to finish.\n")
+        print("\nModes:")
+        print("  --bulk                   Search EDGAR and extract at scale")
+        print("  --url <URL>              Extract from a single filing")
+        print("  --batch <file>           Extract from a file of URLs")
+        print("  (no args)                Interactive mode")
+        print()
+        print("Paste EDGAR 424B2 URLs one at a time. Type 'done' to finish.\n")
         count = 0
         while True:
             url = input("URL (or 'done'): ").strip()

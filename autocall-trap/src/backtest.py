@@ -42,13 +42,13 @@ from src.pricer import price_autocallable
 @dataclass
 class HistoricalNote:
     """A single historical autocallable note with term sheet and outcome."""
-    # ── Identifiers ──
+    # -- Identifiers --
     note_id: str
     issuer: str
     underlying: str
     issue_date: str            # YYYY-MM-DD
 
-    # ── Term sheet ──
+    # -- Term sheet --
     S0: float                  # Initial stock price
     par: float                 # Face value (typically 1000)
     maturity: float            # Years
@@ -60,27 +60,27 @@ class HistoricalNote:
     memory: bool               # Memory coupon
     first_autocall_obs: int    # 1-indexed
 
-    # ── Market data at issuance ──
+    # -- Market data at issuance --
     risk_free_rate: float      # At issuance
     atm_iv: float              # ATM implied vol at issuance
     div_yield: float           # Continuous dividend yield
     issuer_estimated_value: float  # SEC-mandated estimated value (if available)
 
-    # ── Heston calibration at issuance (if available) ──
+    # -- Heston calibration at issuance (if available) --
     heston_v0: Optional[float] = None
     heston_kappa: Optional[float] = None
     heston_theta: Optional[float] = None
     heston_xi: Optional[float] = None
     heston_rho: Optional[float] = None
 
-    # ── Realized outcome ──
+    # -- Realized outcome --
     outcome: Optional[str] = None     # "autocalled", "matured_par", "matured_loss", "still_live"
     autocall_date: Optional[str] = None
     realized_payoff: Optional[float] = None  # Total cash received per $1000 par
     realized_return: Optional[float] = None  # (payoff - par) / par
     holding_period_years: Optional[float] = None
 
-    # ── Computed by engine ──
+    # -- Computed by engine --
     gbm_fair_value: Optional[float] = None
     heston_fair_value: Optional[float] = None
     scp: Optional[float] = None           # Structural Complexity Premium (%)
@@ -105,12 +105,25 @@ class BacktestResult:
     quintile_autocall_rate: Dict[int, float] = field(default_factory=dict)
     quintile_count: Dict[int, int] = field(default_factory=dict)
 
-    # Long-short spread
+    # Strategy 1: Long-Only Q1 vs Benchmark (replaces impractical long-short)
+    q1_avg_return: Optional[float] = None        # Avg return of fairest-priced notes
+    benchmark_return: Optional[float] = None       # S&P 500 buy-and-hold over same period
+    q1_vs_benchmark: Optional[float] = None        # Excess return of Q1 over benchmark
+
+    # Legacy: Long-short spread (kept for reference, but flagged as impractical)
     ls_return: Optional[float] = None  # Q1 return minus Q5 return
+
+    # Strategy 2: Synthetic Short Replication (conceptual)
+    q5_avg_scp_margin: Optional[float] = None      # Avg issuer margin in Q5 (capturable via options)
 
     # Statistical significance
     t_stat: Optional[float] = None
     p_value: Optional[float] = None
+
+    # Fama-MacBeth regression results
+    fm_beta: Optional[float] = None        # SCP factor loading
+    fm_t_stat_nw: Optional[float] = None   # Newey-West corrected t-stat
+    fm_p_value_nw: Optional[float] = None  # Newey-West corrected p-value
 
     notes: List[HistoricalNote] = field(default_factory=list, repr=False)
 
@@ -203,7 +216,7 @@ def price_single_note(
     # Dividend schedule (continuous yield approximation)
     divs = DividendSchedule(yield_pa=note.div_yield) if note.div_yield > 0 else None
 
-    # ── GBM pricing ──
+    # -- GBM pricing --
     S_gbm = simulate_gbm_v2(
         note.S0, note.risk_free_rate, note.atm_iv, note.maturity,
         note.n_obs, n_paths, dividends=divs, seed=seed,
@@ -212,7 +225,7 @@ def price_single_note(
     note.gbm_fair_value = res_gbm.fair_value
     note.gbm_es5 = res_gbm.es_5
 
-    # ── Heston pricing ──
+    # -- Heston pricing --
     # Use provided calibration if available, otherwise estimate from ATM IV
     if note.heston_v0 is not None:
         params = HestonParams(
@@ -236,7 +249,7 @@ def price_single_note(
     note.heston_fair_value = res_heston.fair_value
     note.heston_es5 = res_heston.es_5
 
-    # ── SCP computation ──
+    # -- SCP computation --
     note.scp = (note.par - note.heston_fair_value) / note.par * 100
     note.es_gap = res_gbm.es_5 - res_heston.es_5
 
@@ -246,6 +259,105 @@ def price_single_note(
 # ══════════════════════════════════════════════════════════════════
 # BACKTEST RUNNER
 # ══════════════════════════════════════════════════════════════════
+
+def _run_fama_macbeth(
+    priced_notes: List[HistoricalNote],
+    result: 'BacktestResult',
+    verbose: bool = True,
+):
+    """
+    Run Fama-MacBeth cross-sectional regression to validate SCP as a
+    predictive factor for realized note returns.
+
+    For each issuance cohort (grouped by quarter), run:
+        R_i = alpha + beta * SCP_i + epsilon_i
+
+    Then compute the time-series average of beta and apply Newey-West
+    standard errors to correct for serial correlation from overlapping
+    return horizons.
+
+    This is the standard academic methodology for validating cross-sectional
+    return predictors (Fama & MacBeth, 1973).
+    """
+    # Group notes by issuance quarter
+    notes_with_data = [n for n in priced_notes
+                       if n.scp is not None and n.realized_return is not None]
+
+    if len(notes_with_data) < 10:
+        if verbose:
+            print(f"\n  Fama-MacBeth: Insufficient data ({len(notes_with_data)} notes, need ≥10)")
+        return
+
+    # Parse issue dates into quarters
+    quarters = {}
+    for n in notes_with_data:
+        try:
+            dt = datetime.strptime(n.issue_date, '%Y-%m-%d')
+            q_key = f"{dt.year}Q{(dt.month - 1) // 3 + 1}"
+        except (ValueError, TypeError):
+            q_key = "unknown"
+        if q_key not in quarters:
+            quarters[q_key] = []
+        quarters[q_key].append(n)
+
+    # Run cross-sectional OLS for each quarter
+    betas = []
+    for q_key in sorted(quarters.keys()):
+        q_notes = quarters[q_key]
+        if len(q_notes) < 3:
+            continue  # Need at least 3 notes for meaningful regression
+
+        y = np.array([n.realized_return for n in q_notes])
+        x = np.array([n.scp for n in q_notes])
+
+        # Simple OLS: y = alpha + beta * x
+        x_dm = x - np.mean(x)
+        beta = np.sum(x_dm * y) / (np.sum(x_dm ** 2) + 1e-12)
+        betas.append(beta)
+
+    if len(betas) < 2:
+        if verbose:
+            print(f"\n  Fama-MacBeth: Too few quarterly cohorts ({len(betas)})")
+        return
+
+    betas = np.array(betas)
+    T = len(betas)
+    beta_bar = np.mean(betas)
+
+    # Newey-West standard error with automatic lag selection
+    # Lag = floor(4 * (T/100)^(2/9))  — Andrews (1991) rule of thumb
+    max_lag = max(1, int(np.floor(4 * (T / 100) ** (2.0 / 9.0))))
+    max_lag = min(max_lag, T - 1)
+
+    # Compute autocovariance-weighted variance
+    demean = betas - beta_bar
+    gamma_0 = np.sum(demean ** 2) / T
+
+    nw_var = gamma_0
+    for lag in range(1, max_lag + 1):
+        # Bartlett kernel weight
+        w = 1.0 - lag / (max_lag + 1.0)
+        gamma_lag = np.sum(demean[lag:] * demean[:-lag]) / T
+        nw_var += 2 * w * gamma_lag
+
+    nw_se = np.sqrt(nw_var / T)
+
+    if nw_se > 0:
+        t_stat_nw = beta_bar / nw_se
+        from scipy.stats import norm
+        p_value_nw = 2 * (1 - norm.cdf(abs(t_stat_nw)))
+    else:
+        t_stat_nw = 0.0
+        p_value_nw = 1.0
+
+    result.fm_beta = beta_bar
+    result.fm_t_stat_nw = t_stat_nw
+    result.fm_p_value_nw = p_value_nw
+
+    if verbose:
+        print(f"\n  Fama-MacBeth: {T} quarterly cohorts, "
+              f"beta={beta_bar:.4f}, NW t={t_stat_nw:.3f}, p={p_value_nw:.4f}")
+
 
 def run_backtest(
     notes: List[HistoricalNote],
@@ -269,7 +381,7 @@ def run_backtest(
         print(f"  Paths per note: {n_paths:,}")
         print()
 
-    # ── Step 1: Price all notes ──
+    # -- Step 1: Price all notes --
     for i, note in enumerate(notes):
         seed = seed_base + i
         price_single_note(note, n_paths=n_paths, seed=seed)
@@ -279,7 +391,7 @@ def run_backtest(
                 status += f", realized={note.realized_return*100:.1f}%"
             print(f"  [{i+1}/{len(notes)}] {note.note_id} ({note.underlying}): {status}")
 
-    # ── Step 2: Sort into quintiles ──
+    # -- Step 2: Sort into quintiles --
     priced_notes = [n for n in notes if n.scp is not None]
     priced_notes.sort(key=lambda n: n.scp)
 
@@ -293,7 +405,7 @@ def run_backtest(
                 priced_notes[idx].quintile = q
                 idx += 1
 
-    # ── Step 3: Compute quintile statistics ──
+    # -- Step 3: Compute quintile statistics --
     result = BacktestResult(
         n_notes=len(notes),
         n_with_outcomes=sum(1 for n in notes if n.realized_return is not None),
@@ -313,10 +425,19 @@ def run_backtest(
             result.quintile_autocall_rate[q] = np.mean([1 if n.outcome == 'autocalled' else 0 for n in q_with_outcomes])
             result.quintile_ki_breach_rate[q] = np.mean([1 if n.outcome == 'matured_loss' else 0 for n in q_with_outcomes])
 
-    # ── Step 4: Long-short spread and t-test ──
+    # -- Step 4: Strategy 1 — Long-Only Q1 vs Benchmark --
     q1_returns = [n.realized_return for n in priced_notes if n.quintile == 1 and n.realized_return is not None]
     q5_returns = [n.realized_return for n in priced_notes if n.quintile == 5 and n.realized_return is not None]
 
+    if q1_returns:
+        result.q1_avg_return = np.mean(q1_returns)
+        # Approximate S&P 500 benchmark: ~10% annualized, scaled to avg holding period
+        avg_hold = np.mean([n.holding_period_years for n in priced_notes
+                           if n.quintile == 1 and n.holding_period_years is not None] or [1.5])
+        result.benchmark_return = (1.10 ** avg_hold - 1)  # Compound 10% p.a.
+        result.q1_vs_benchmark = result.q1_avg_return - result.benchmark_return
+
+    # Legacy long-short spread (flagged as impractical for OTC notes)
     if q1_returns and q5_returns:
         result.ls_return = np.mean(q1_returns) - np.mean(q5_returns)
 
@@ -327,11 +448,18 @@ def run_backtest(
         if s1 > 0 and s5 > 0:
             se = np.sqrt(s1**2 / n1 + s5**2 / n5)
             result.t_stat = (m1 - m5) / se
-            # Approximate p-value using normal (good enough for large N)
             from scipy.stats import norm
             result.p_value = 2 * (1 - norm.cdf(abs(result.t_stat)))
 
-    # ── Print summary ──
+    # -- Step 5: Strategy 2 — Synthetic Short (Capturable Margin) --
+    q5_notes_with_scp = [n for n in priced_notes if n.quintile == 5 and n.scp is not None]
+    if q5_notes_with_scp:
+        result.q5_avg_scp_margin = np.mean([n.scp for n in q5_notes_with_scp])
+
+    # -- Step 6: Fama-MacBeth cross-sectional regression --
+    _run_fama_macbeth(priced_notes, result, verbose)
+
+    # -- Print summary --
     if verbose:
         print(f"\n{'BACKTEST RESULTS':=^60}")
         print(f"  Notes priced:     {len(priced_notes)}")
@@ -352,12 +480,43 @@ def run_backtest(
             ki_str = f"{ki*100:.0f}%" if ki is not None else "N/A"
             print(f"  Q{q:1d} | {cnt:5d} | {scp:7.2f}% | {ret_str:>10s} | {ac_str:>8s} | {ki_str:>9s}")
 
+        # Strategy 1: Long-Only Q1 vs Benchmark
+        print(f"\n  {'STRATEGY 1: Long-Only Q1 vs Benchmark':-^55}")
+        if result.q1_avg_return is not None:
+            print(f"  Q1 (fairest notes) avg return:  {result.q1_avg_return*100:+.2f}%")
+            print(f"  S&P 500 benchmark return:       {result.benchmark_return*100:+.2f}%")
+            print(f"  Q1 excess return:               {result.q1_vs_benchmark*100:+.2f}%")
+        else:
+            print(f"  (No Q1 outcome data available)")
+
+        # Legacy long-short (with caveat)
         if result.ls_return is not None:
-            print(f"\n  Long-Short (Q1 - Q5): {result.ls_return*100:.2f}%")
+            print(f"\n  {'REFERENCE: Long-Short Spread (impractical for OTC)':-^55}")
+            print(f"  Q1 - Q5 spread: {result.ls_return*100:.2f}%")
             if result.t_stat is not None:
                 print(f"  t-stat: {result.t_stat:.3f}, p-value: {result.p_value:.4f}")
                 sig = "***" if result.p_value < 0.01 else "**" if result.p_value < 0.05 else "*" if result.p_value < 0.10 else ""
                 print(f"  Significance: {sig if sig else 'Not significant'}")
+            print(f"  NOTE: Shorting retail structured notes is not feasible.")
+            print(f"  See Strategy 2 for synthetic replication.")
+
+        # Strategy 2: Synthetic Short
+        if result.q5_avg_scp_margin is not None:
+            print(f"\n  {'STRATEGY 2: Synthetic Short Replication':-^55}")
+            print(f"  Q5 avg SCP (capturable margin): {result.q5_avg_scp_margin:.2f}%")
+            print(f"  A quant desk can replicate Q5 note downside using")
+            print(f"  exchange-traded options (put spreads + digital coupons)")
+            print(f"  and capture this margin by selling the replication at")
+            print(f"  the issuer's inflated price.")
+
+        # Fama-MacBeth results
+        if result.fm_beta is not None:
+            print(f"\n  {'FAMA-MACBETH REGRESSION':-^55}")
+            print(f"  SCP factor beta:     {result.fm_beta:.4f}")
+            print(f"  NW t-stat:           {result.fm_t_stat_nw:.3f}")
+            print(f"  NW p-value:          {result.fm_p_value_nw:.4f}")
+            sig = "***" if result.fm_p_value_nw < 0.01 else "**" if result.fm_p_value_nw < 0.05 else "*" if result.fm_p_value_nw < 0.10 else ""
+            print(f"  Significance:        {sig if sig else 'Not significant'}")
 
     return result
 
@@ -554,7 +713,7 @@ DATA_REQUIREMENTS = """
 ╠══════════════════════════════════════════════════════════════════╣
 ║                                                                  ║
 ║  1. NOTES UNIVERSE (notes_universe.csv)                          ║
-║     ─────────────────────────────────────                        ║
+║     -------------------------------------                        ║
 ║     Source: SEC EDGAR (424B2 filings)                            ║
 ║     URL:    https://efts.sec.gov/LATEST/search-index             ║
 ║                                                                  ║
@@ -571,7 +730,7 @@ DATA_REQUIREMENTS = """
 ║     Target: 200-500 notes, 2018-2024, across 6+ issuers         ║
 ║                                                                  ║
 ║  2. IMPLIED VOLATILITY AT ISSUANCE                               ║
-║     ─────────────────────────────────                            ║
+║     ---------------------------------                            ║
 ║     Source: Bloomberg OVDV, CBOE LiveVol, OptionMetrics          ║
 ║                                                                  ║
 ║     What you need:                                               ║
@@ -588,7 +747,7 @@ DATA_REQUIREMENTS = """
 ║     options chain (ATM vol only, no surface)                     ║
 ║                                                                  ║
 ║  3. REALIZED OUTCOMES                                            ║
-║     ─────────────────                                            ║
+║     -----------------                                            ║
 ║     Source: Issuer websites, Bloomberg PORT, Halo Investing       ║
 ║                                                                  ║
 ║     For each note, you need to know:                             ║
@@ -605,23 +764,23 @@ DATA_REQUIREMENTS = """
 ║        determine exactly what happened on each obs date          ║
 ║                                                                  ║
 ║  4. RISK-FREE RATES (historical)                                 ║
-║     ──────────────────────────────                               ║
+║     ------------------------------                               ║
 ║     Source: FRED (Federal Reserve Economic Data)                 ║
 ║     Series: DGS2 (2-year Treasury yield)                         ║
 ║     URL:    https://fred.stlouisfed.org/series/DGS2              ║
 ║                                                                  ║
 ║  5. DIVIDEND DATA                                                ║
-║     ──────────────                                               ║
+║     --------------                                               ║
 ║     Source: Bloomberg BDVD, Yahoo Finance, or Nasdaq.com          ║
 ║     Need: ex-dates and amounts for each underlying               ║
 ║                                                                  ║
 ║  6. ESG RATINGS (optional, for Strategy 3)                       ║
-║     ──────────────────────────────────────                       ║
+║     --------------------------------------                       ║
 ║     Source: MSCI ESG Ratings, Sustainalytics, Refinitiv          ║
 ║     Need: ESG rating for each underlying + each issuer           ║
 ║     Access: Bloomberg ESG <GO>, or MSCI ESG Manager              ║
 ║                                                                  ║
-║  ────────────────────────────────────────────────────────────    ║
+║  ------------------------------------------------------------    ║
 ║                                                                  ║
 ║  CSV FORMAT (notes_universe.csv):                                ║
 ║                                                                  ║

@@ -169,32 +169,48 @@ def _float_or_none(val):
 # STEP 2: PULL YAHOO FINANCE DATA
 # ══════════════════════════════════════════════════════════════════
 
+_TICKER_MAP = {
+    'SPX': '^GSPC',    # S&P 500 index
+    'NDX': '^NDX',     # Nasdaq-100 index
+    'RUT': '^RUT',     # Russell 2000 index
+    'DJI': '^DJI',     # Dow Jones Industrial
+}
+
+
 def pull_yahoo_data(
     tickers: List[str],
     start_date: str,
     end_date: str,
 ) -> Dict[str, pd.DataFrame]:
     """
-    Pull daily prices and dividends from Yahoo Finance.
+    Pull daily ADJUSTED prices and dividends from Yahoo Finance.
     Returns dict of {ticker: DataFrame with columns [Close, Dividends]}.
+
+    IMPORTANT: We use auto_adjust=True so that stock splits and special
+    dividends are reflected in the price series. Without this, a 10-for-1
+    split (e.g. NVDA June 2024) appears as a ~90% price crash, falsely
+    triggering barrier breaches in the backtest.
     """
     data = {}
     for ticker in tickers:
-        print(f"  Pulling {ticker} from Yahoo Finance...", end=" ")
+        yf_ticker = _TICKER_MAP.get(ticker, ticker)
+        print(f"  Pulling {ticker} ({yf_ticker}) from Yahoo Finance (adjusted)...", end=" ")
         try:
-            stock = yf.Ticker(ticker)
-            hist = stock.history(start=start_date, end=end_date, auto_adjust=False)
+            stock = yf.Ticker(yf_ticker)
+            # auto_adjust=True: Close = backward-adjusted for splits & dividends
+            hist = stock.history(start=start_date, end=end_date, auto_adjust=True)
             if len(hist) == 0:
                 print(f"NO DATA")
                 continue
-            # Keep just Close and Dividends
+            # With auto_adjust=True, 'Close' is already the adjusted close.
+            # Dividends are still reported in nominal terms.
             df = pd.DataFrame({
                 'Close': hist['Close'],
                 'Dividends': hist['Dividends'] if 'Dividends' in hist.columns else 0,
             })
             df.index = pd.to_datetime(df.index).tz_localize(None)
             data[ticker] = df
-            print(f"{len(df)} days")
+            print(f"{len(df)} days (adjusted)")
         except Exception as e:
             print(f"ERROR: {e}")
     return data
@@ -310,15 +326,26 @@ def reconstruct_outcome(
     div_yield: float,
 ) -> EnrichedNote:
     """
-    Given a term sheet and daily prices, walk through each observation
-    date and determine exactly what happened.
+    Given a term sheet and daily ADJUSTED prices, walk through each
+    observation date and determine exactly what happened.
+
+    IMPORTANT: Because we use backward-adjusted prices from Yahoo Finance,
+    we must also adjust S0 to the same basis. We look up the adjusted price
+    on the issue date, so that barrier levels (as fractions of S0) are
+    consistent with the adjusted price series. This correctly handles
+    stock splits that occurred after the note's issuance.
     """
+    # Look up the adjusted price on the issue date to re-base S0
+    adjusted_S0 = get_price_on_date(price_data, term_sheet.issue_date)
+    if adjusted_S0 is None:
+        adjusted_S0 = term_sheet.S0  # Fallback to nominal if no data
+
     note = EnrichedNote(
         note_id=term_sheet.note_id,
         issuer=term_sheet.issuer,
         underlying=term_sheet.underlying,
         issue_date=term_sheet.issue_date,
-        S0=term_sheet.S0,
+        S0=term_sheet.S0,  # Store original nominal S0 for the record
         maturity=term_sheet.maturity,
         n_obs=term_sheet.n_obs,
         coupon_rate=term_sheet.coupon_rate,
@@ -343,10 +370,11 @@ def reconstruct_outcome(
 
     maturity_date = obs_dates[-1]
 
-    # Barrier levels in dollar terms
-    autocall_level = term_sheet.autocall_trigger * term_sheet.S0
-    coupon_level = term_sheet.coupon_barrier * term_sheet.S0
-    ki_level = term_sheet.ki_barrier * term_sheet.S0
+    # Barrier levels in dollar terms — using adjusted S0 so barriers
+    # are consistent with the adjusted price series
+    autocall_level = term_sheet.autocall_trigger * adjusted_S0
+    coupon_level = term_sheet.coupon_barrier * adjusted_S0
+    ki_level = term_sheet.ki_barrier * adjusted_S0
     coupon_dollar = term_sheet.coupon_rate * 1000.0
 
     # Walk through observation dates
@@ -405,9 +433,15 @@ def reconstruct_outcome(
     final_price = obs_price_list[-1] if obs_price_list else term_sheet.S0
 
     if ki_breached:
-        # Investor bears the loss
-        terminal_value = 1000.0 * min(final_price / term_sheet.S0, 1.0)
-        note.outcome = "matured_loss"
+        # Knock-in activated — but the stock may have recovered.
+        # Terminal value is capped at par: min(S_final / S0, 1.0) * par
+        terminal_ratio = min(final_price / adjusted_S0, 1.0)
+        terminal_value = 1000.0 * terminal_ratio
+        if terminal_ratio < 1.0:
+            note.outcome = "matured_loss"
+        else:
+            # Stock recovered above initial level — no loss despite KI breach
+            note.outcome = "matured_par"
         note.realized_payoff = terminal_value + total_coupons
     else:
         note.outcome = "matured_par"
@@ -576,14 +610,101 @@ def run_pipeline(input_file: str, output_file: str = "notes_universe.csv"):
     return enriched_notes
 
 
+def enrich_existing_csv(input_file: str, output_file: str):
+    """
+    Enrich an existing notes CSV (like sids_notes.csv) that has term sheet
+    data but placeholder market data. Pulls actual risk-free rates, realized
+    vol (proxy for ATM IV), and dividend yields from Yahoo Finance / FRED.
+    Also reconstructs realized outcomes using adjusted prices.
+    """
+    print("=" * 60)
+    print("ENRICHING EXISTING NOTES WITH MARKET DATA")
+    print("=" * 60)
+
+    # Read existing CSV
+    notes_raw = []
+    with open(input_file, 'r') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            notes_raw.append(row)
+    print(f"  Loaded {len(notes_raw)} notes from {input_file}")
+
+    # Convert to NoteTermSheet objects
+    term_sheets = []
+    for row in notes_raw:
+        ts = NoteTermSheet(
+            note_id=row['note_id'].strip(),
+            issuer=row['issuer'].strip(),
+            underlying=row['underlying'].strip().upper(),
+            issue_date=row['issue_date'].strip(),
+            S0=float(row['S0']),
+            maturity=float(row['maturity']),
+            n_obs=int(row['n_obs']),
+            coupon_rate=float(row['coupon_rate']),
+            autocall_trigger=float(row['autocall_trigger']),
+            coupon_barrier=float(row['coupon_barrier']),
+            ki_barrier=float(row['ki_barrier']),
+            memory=row.get('memory', 'True').strip().lower() in ('true', '1', 'yes'),
+            issuer_estimated_value=_float_or_none(row.get('issuer_estimated_value', '')),
+            first_autocall_obs=int(row.get('first_autocall_obs', 2)),
+        )
+        term_sheets.append(ts)
+
+    # Run the standard pipeline from here
+    tickers = list(set(ts.underlying for ts in term_sheets))
+    earliest = min(ts.issue_date for ts in term_sheets)
+    latest_issue = max(ts.issue_date for ts in term_sheets)
+    start = (pd.Timestamp(earliest) - timedelta(days=90)).strftime('%Y-%m-%d')
+    end = (pd.Timestamp(latest_issue) + timedelta(days=int(365 * 5.5))).strftime('%Y-%m-%d')
+    today = datetime.now().strftime('%Y-%m-%d')
+    if end > today:
+        end = today
+
+    print(f"\n  Tickers: {tickers}")
+    print(f"  Date range: {start} to {end}")
+
+    print(f"\n[1/3] Pulling stock prices (adjusted)...")
+    yahoo_data = pull_yahoo_data(tickers, start, end)
+
+    print(f"\n[2/3] Pulling risk-free rates from FRED...")
+    rates_df = pull_fred_rates(start, end)
+
+    print(f"\n[3/3] Enriching notes with actual market data + reconstructing outcomes...")
+    enriched_notes = []
+    for ts in term_sheets:
+        ticker = ts.underlying
+        if ticker not in yahoo_data:
+            print(f"  SKIP: {ts.note_id} — no price data for {ticker}")
+            continue
+
+        price_df = yahoo_data[ticker]
+        rfr = get_rate_on_date(rates_df, ts.issue_date)
+        atm_iv = estimate_realized_vol(price_df, ts.issue_date, window=60)
+        div_y = estimate_div_yield(price_df, ts.issue_date, ts.S0)
+
+        note = reconstruct_outcome(ts, price_df, rfr, atm_iv, div_y)
+        enriched_notes.append(note)
+
+        print(f"  {note.note_id}: rfr={rfr:.4f}, iv={atm_iv:.4f}, div={div_y:.4f} "
+              f"-> {note.outcome}, return={note.realized_return*100:+.1f}%")
+
+    export_notes_csv(enriched_notes, output_file)
+    print_summary(enriched_notes)
+    return enriched_notes
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Autocall Trap Data Pipeline")
     parser.add_argument("--input", type=str, default=None, help="Path to term_sheets.csv")
     parser.add_argument("--output", type=str, default="notes_universe.csv", help="Output CSV path")
     parser.add_argument("--demo", action="store_true", help="Run with sample data")
+    parser.add_argument("--enrich", type=str, default=None,
+                        help="Enrich an existing notes CSV with actual market data")
     args = parser.parse_args()
 
-    if args.demo:
+    if args.enrich:
+        enrich_existing_csv(args.enrich, args.output)
+    elif args.demo:
         # Write demo CSV to temp file
         demo_path = "data/demo_term_sheets.csv"
         os.makedirs("data", exist_ok=True)
