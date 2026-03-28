@@ -90,6 +90,29 @@ if "historical_notes" not in st.session_state:
 # HELPER FUNCTIONS
 # ═══════════════════════════════════════════════════════════════════
 
+def _safe_float(val, default=None):
+    """Safely extract float from pandas row (handles NaN, None, empty)."""
+    if val is None:
+        return default
+    try:
+        f = float(val)
+        if np.isnan(f):
+            return default
+        return f
+    except (ValueError, TypeError):
+        return default
+
+
+def _safe_str(val, default=None):
+    """Safely extract string from pandas row (handles NaN)."""
+    if val is None:
+        return default
+    if isinstance(val, float) and np.isnan(val):
+        return default
+    s = str(val).strip()
+    return s if s else default
+
+
 def calibrate_heston_from_iv(atm_iv: float, maturity: float) -> HestonParams:
     """Quick Heston calibration from ATM IV — maps vol surface shape."""
     v0 = atm_iv ** 2
@@ -108,6 +131,9 @@ def evaluate_note(
     n_paths: int = 100_000, seed: int = 42,
     note_id: str = "", issuer: str = "", underlying: str = "",
     issuer_estimated_value: float = None,
+    issue_date: str = "", outcome: str = None,
+    realized_payoff: float = None, realized_return: float = None,
+    holding_period_years: float = None,
 ) -> dict:
     """Run full GBM + Heston evaluation on a single note."""
 
@@ -182,6 +208,12 @@ def evaluate_note(
         "heston_theta": heston_params.theta,
         "heston_xi": heston_params.xi,
         "heston_rho": heston_params.rho,
+        # Realized outcome data (from historical CSV)
+        "issue_date": issue_date or "2023-01-01",
+        "outcome": outcome,
+        "realized_payoff": realized_payoff,
+        "realized_return": realized_return,
+        "holding_period_years": holding_period_years,
         # Raw payoffs for plots
         "payoffs_gbm": result_gbm.payoffs,
         "payoffs_heston": result_heston.payoffs,
@@ -621,7 +653,12 @@ with tabs[0]:
                         note_id=row.get("note_id", f"CSV-{idx+1}"),
                         issuer=row.get("issuer", ""),
                         underlying=row.get("underlying", ""),
-                        issuer_estimated_value=row.get("issuer_estimated_value", None),
+                        issuer_estimated_value=_safe_float(row.get("issuer_estimated_value")),
+                        issue_date=_safe_str(row.get("issue_date"), "2023-01-01"),
+                        outcome=_safe_str(row.get("outcome")),
+                        realized_payoff=_safe_float(row.get("realized_payoff")),
+                        realized_return=_safe_float(row.get("realized_return")),
+                        holding_period_years=_safe_float(row.get("holding_period_years")),
                     )
                     st.session_state.evaluated_notes.append(result)
 
@@ -663,7 +700,12 @@ with tabs[0]:
                         note_id=row.get("note_id", f"NOTE-{idx+1}"),
                         issuer=row.get("issuer", ""),
                         underlying=row.get("underlying", ""),
-                        issuer_estimated_value=row.get("issuer_estimated_value", None),
+                        issuer_estimated_value=_safe_float(row.get("issuer_estimated_value")),
+                        issue_date=_safe_str(row.get("issue_date"), "2023-01-01"),
+                        outcome=_safe_str(row.get("outcome")),
+                        realized_payoff=_safe_float(row.get("realized_payoff")),
+                        realized_return=_safe_float(row.get("realized_return")),
+                        holding_period_years=_safe_float(row.get("holding_period_years")),
                     )
                     st.session_state.evaluated_notes.append(result)
 
@@ -783,7 +825,7 @@ with tabs[2]:
                         note_id=n["note_id"],
                         issuer=n["issuer"],
                         underlying=n["underlying"],
-                        issue_date="2023-01-01",
+                        issue_date=n.get("issue_date", "2023-01-01"),
                         S0=n["S0"], par=n["par"],
                         maturity=n["maturity"], n_obs=n["n_obs"],
                         coupon_rate=n["coupon_rate"],
@@ -796,6 +838,12 @@ with tabs[2]:
                         atm_iv=n["atm_iv"],
                         div_yield=n["div_yield"],
                         issuer_estimated_value=n.get("issuer_estimated_value"),
+                        # Realized outcome data — critical for backtest!
+                        outcome=n.get("outcome"),
+                        realized_payoff=n.get("realized_payoff"),
+                        realized_return=n.get("realized_return"),
+                        holding_period_years=n.get("holding_period_years"),
+                        # Pre-computed pricing (avoid redundant re-pricing)
                         gbm_fair_value=n["gbm_fair_value"],
                         heston_fair_value=n["heston_fair_value"],
                         scp=n["scp"],

@@ -381,10 +381,13 @@ def run_backtest(
         print(f"  Paths per note: {n_paths:,}")
         print()
 
-    # -- Step 1: Price all notes --
+    # -- Step 1: Price all notes (skip if already priced) --
     for i, note in enumerate(notes):
-        seed = seed_base + i
-        price_single_note(note, n_paths=n_paths, seed=seed)
+        if note.scp is not None and note.gbm_fair_value is not None and note.heston_fair_value is not None:
+            pass  # Already priced — skip expensive re-computation
+        else:
+            seed = seed_base + i
+            price_single_note(note, n_paths=n_paths, seed=seed)
         if verbose:
             status = f"SCP={note.scp:.2f}%"
             if note.realized_return is not None:
