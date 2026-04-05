@@ -3,7 +3,7 @@ Autocall Trap — Interactive Note Evaluator & Backtest Dashboard
 Run: streamlit run app.py
 """
 
-import sys, os, io, time, tempfile
+import sys, os, io, time, tempfile, re
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -89,6 +89,299 @@ if "historical_notes" not in st.session_state:
 # ═══════════════════════════════════════════════════════════════════
 # HELPER FUNCTIONS
 # ═══════════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════
+# PDF TERM SHEET EXTRACTOR
+# ═══════════════════════════════════════════════════════════════════
+
+def extract_pdf_text(pdf_bytes: bytes) -> str:
+    """Extract all text from a PDF file."""
+    import fitz  # PyMuPDF
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    text = ""
+    for page in doc:
+        text += page.get_text() + "\n"
+    doc.close()
+    return text
+
+
+def _find_pattern(text: str, patterns: list, cast=str, default=None):
+    """Try multiple regex patterns and return first match."""
+    for pat in patterns:
+        m = re.search(pat, text, re.IGNORECASE | re.DOTALL)
+        if m:
+            try:
+                val = m.group(1).strip().replace(",", "").replace("$", "")
+                return cast(val)
+            except (ValueError, TypeError):
+                continue
+    return default
+
+
+def _parse_date(text: str, patterns: list) -> Optional[str]:
+    """Extract and normalize a date to YYYY-MM-DD."""
+    for pat in patterns:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            raw = m.group(1).strip()
+            # Try common date formats
+            for fmt in ["%B %d, %Y", "%b %d, %Y", "%m/%d/%Y", "%m/%d/%y",
+                        "%Y-%m-%d", "%d-%b-%Y", "%d %B %Y", "%B %d,%Y"]:
+                try:
+                    dt = datetime.strptime(raw, fmt)
+                    return dt.strftime("%Y-%m-%d")
+                except ValueError:
+                    continue
+    return None
+
+
+def _parse_percent_as_fraction(text: str, patterns: list) -> Optional[float]:
+    """Extract a percentage and return as decimal fraction (70% -> 0.70)."""
+    for pat in patterns:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            try:
+                val = float(m.group(1).replace(",", ""))
+                if val > 1:  # It's a percentage like 70
+                    return val / 100.0
+                return val  # Already a fraction
+            except (ValueError, TypeError):
+                continue
+    return None
+
+
+def extract_term_sheet_from_pdf(pdf_bytes: bytes, filename: str = "") -> dict:
+    """
+    Extract autocallable note term sheet parameters from a SEC 424B2 filing PDF.
+    Returns a dict of extracted parameters with confidence flags.
+    """
+    text = extract_pdf_text(pdf_bytes)
+
+    # Normalize whitespace
+    text_clean = re.sub(r'\s+', ' ', text)
+
+    result = {
+        "source_file": filename,
+        "raw_text_length": len(text),
+        "fields_found": 0,
+        "fields_total": 15,
+        "warnings": [],
+    }
+
+    # ── ISSUER ──
+    issuer_map = {
+        "jpmorgan": "JPMorgan", "j.p. morgan": "JPMorgan", "jp morgan": "JPMorgan",
+        "goldman sachs": "Goldman Sachs", "gs finance": "Goldman Sachs",
+        "morgan stanley": "Morgan Stanley",
+        "citigroup": "Citigroup", "citi ": "Citigroup",
+        "hsbc": "HSBC",
+        "barclays": "Barclays",
+        "bofa": "BofA", "bank of america": "BofA", "merrill": "BofA",
+        "ubs": "UBS",
+        "credit suisse": "Credit Suisse",
+        "wells fargo": "Wells Fargo",
+        "royal bank of canada": "RBC", "rbc": "RBC",
+    }
+    issuer = None
+    text_lower = text.lower()
+    for key, val in issuer_map.items():
+        if key in text_lower[:2000]:  # Check first 2000 chars
+            issuer = val
+            break
+    result["issuer"] = issuer or ""
+
+    # ── UNDERLYING ──
+    # Look for ticker in parentheses after stock name, or "Linked to" pattern
+    underlying = _find_pattern(text_clean, [
+        r'(?:linked to|underlying[:\s]+).*?\(([A-Z]{1,5})\)',
+        r'(?:linked to|reference asset[:\s]+).*?common stock of\s+\w+[\w\s]*?\(([A-Z]{1,5})\)',
+        r'ticker[:\s]+["\']?([A-Z]{1,5})["\']?',
+        r'(?:shares? of|stock of)\s+[\w\s,]+\(([A-Z]{1,5})\)',
+        r'\((?:NYSE|NASDAQ|CBOE)[:\s]+([A-Z]{1,5})\)',
+    ])
+    result["underlying"] = underlying or ""
+
+    # ── TRADE DATE / PRICING DATE ──
+    trade_date = _parse_date(text_clean, [
+        r'(?:trade date|pricing date)[:\s]*(\w+\s+\d{1,2},?\s+\d{4})',
+        r'(?:trade date|pricing date)[:\s]*(\d{1,2}/\d{1,2}/\d{2,4})',
+        r'(?:trade date|pricing date)[:\s]*(\d{4}-\d{2}-\d{2})',
+    ])
+    result["issue_date"] = trade_date or ""
+
+    # ── INITIAL PRICE / S0 ──
+    s0 = _find_pattern(text_clean, [
+        r'(?:initial (?:stock |share |spot )?price|closing price on (?:the )?(?:trade|pricing) date)[:\s]*\$?([\d,]+\.?\d*)',
+        r'(?:initial (?:level|value))[:\s]*\$?([\d,]+\.?\d*)',
+        r'(?:stock closing price)[:\s]*\$?([\d,]+\.?\d*)',
+    ], cast=float)
+    result["S0"] = s0
+
+    # ── PAR / PRINCIPAL ──
+    par = _find_pattern(text_clean, [
+        r'(?:principal amount|face amount|denomination)[:\s]*\$?([\d,]+)(?:\s*per)',
+        r'(?:stated principal amount)[:\s]*\$?([\d,]+)',
+    ], cast=float, default=1000.0)
+    result["par"] = par
+
+    # ── MATURITY ──
+    maturity_date = _parse_date(text_clean, [
+        r'(?:maturity date|final valuation date)[:\s]*(\w+\s+\d{1,2},?\s+\d{4})',
+        r'(?:maturity date)[:\s]*(\d{1,2}/\d{1,2}/\d{2,4})',
+    ])
+    result["maturity_date_raw"] = maturity_date
+
+    # Calculate maturity in years
+    if trade_date and maturity_date:
+        try:
+            td = datetime.strptime(trade_date, "%Y-%m-%d")
+            md = datetime.strptime(maturity_date, "%Y-%m-%d")
+            result["maturity"] = round((md - td).days / 365.25, 2)
+        except ValueError:
+            result["maturity"] = None
+    else:
+        # Try to find maturity as duration
+        mat = _find_pattern(text_clean, [
+            r'(?:term|tenor|maturity)[:\s]*(?:approximately\s+)?(\d+)\s*(?:year|yr)',
+            r'(\d+)[- ]?year\s*(?:note|bond|securit)',
+        ], cast=float)
+        if mat:
+            result["maturity"] = mat
+        else:
+            # Try months
+            mat_months = _find_pattern(text_clean, [
+                r'(?:term|tenor|maturity)[:\s]*(?:approximately\s+)?(\d+)\s*month',
+            ], cast=float)
+            result["maturity"] = round(mat_months / 12, 2) if mat_months else None
+
+    # ── OBSERVATION FREQUENCY / N_OBS ──
+    n_obs = _find_pattern(text_clean, [
+        r'(\d+)\s*(?:total\s+)?observation\s*dates?',
+        r'observation\s*dates?[:\s]*(\d+)',
+    ], cast=int)
+
+    if not n_obs and result.get("maturity"):
+        # Infer from frequency
+        freq_match = re.search(r'(quarterly|monthly|semi-annual|annual)', text_clean, re.IGNORECASE)
+        if freq_match:
+            freq = freq_match.group(1).lower()
+            mat = result["maturity"]
+            if freq == "quarterly":
+                n_obs = int(mat * 4)
+            elif freq == "monthly":
+                n_obs = int(mat * 12)
+            elif freq == "semi-annual":
+                n_obs = int(mat * 2)
+            elif freq == "annual":
+                n_obs = int(mat)
+    result["n_obs"] = n_obs
+
+    # ── COUPON RATE ──
+    # Try per-period first
+    coupon_per_period = _find_pattern(text_clean, [
+        r'(?:contingent (?:interest|coupon|income))[^.]*?([\d.]+)%\s*(?:per|each)\s*(?:quarter|observation|period|month)',
+        r'([\d.]+)%\s*(?:per|each)\s*(?:quarter|period).*?(?:contingent|coupon)',
+    ], cast=float)
+    if coupon_per_period:
+        result["coupon_rate"] = coupon_per_period / 100.0
+    else:
+        # Try annualized and convert
+        coupon_annual = _find_pattern(text_clean, [
+            r'(?:contingent (?:interest|coupon|income))[^.]*?([\d.]+)%\s*(?:per annum|p\.?a\.?|annual)',
+            r'([\d.]+)%\s*(?:per annum|p\.?a\.?|annual).*?(?:contingent|coupon)',
+            r'(?:contingent (?:interest|coupon|income)\s*(?:rate)?)[:\s]*([\d.]+)%',
+        ], cast=float)
+        if coupon_annual and result.get("n_obs") and result.get("maturity"):
+            periods_per_year = result["n_obs"] / result["maturity"]
+            result["coupon_rate"] = (coupon_annual / 100.0) / periods_per_year
+        elif coupon_annual:
+            result["coupon_rate"] = (coupon_annual / 100.0) / 4  # Default quarterly
+            result["warnings"].append("Assumed quarterly coupon frequency")
+        else:
+            result["coupon_rate"] = None
+
+    # ── AUTOCALL TRIGGER ──
+    autocall = _parse_percent_as_fraction(text_clean, [
+        r'(?:autocall|automatic call|call trigger|redemption)\s*(?:level|trigger|price|threshold)[:\s]*([\d.]+)%',
+        r'([\d.]+)%\s*of\s*(?:the\s+)?initial\s*(?:price|level|value).*?(?:autocall|call)',
+        r'(?:autocall|auto-call).*?([\d.]+)%\s*of\s*(?:initial|strike)',
+    ])
+    result["autocall_trigger"] = autocall or 1.0  # Default 100%
+
+    # ── COUPON BARRIER ──
+    coupon_barrier = _parse_percent_as_fraction(text_clean, [
+        r'(?:coupon|interest)\s*(?:barrier|threshold|level)[:\s]*([\d.]+)%',
+        r'([\d.]+)%\s*of\s*(?:the\s+)?initial\s*(?:price|level).*?(?:coupon|interest)\s*(?:barrier|threshold)',
+        r'(?:coupon|contingent interest).*?(?:at or above|greater than|not less than)\s*([\d.]+)%',
+    ])
+    result["coupon_barrier"] = coupon_barrier
+
+    # ── KNOCK-IN BARRIER ──
+    ki_barrier = _parse_percent_as_fraction(text_clean, [
+        r'(?:knock[- ]?in|downside|final)\s*(?:barrier|threshold|level|price)[:\s]*([\d.]+)%',
+        r'([\d.]+)%\s*of\s*(?:the\s+)?initial\s*(?:price|level).*?(?:knock|barrier|downside)',
+        r'(?:barrier|protection)\s*(?:level|price)[:\s]*([\d.]+)%\s*of\s*(?:initial|strike)',
+    ])
+    # Check if it's expressed as a decline instead
+    if not ki_barrier:
+        decline = _find_pattern(text_clean, [
+            r'([\d.]+)%\s*(?:decline|decrease|loss).*?(?:knock|barrier)',
+            r'(?:knock|barrier).*?([\d.]+)%\s*(?:decline|decrease)',
+        ], cast=float)
+        if decline:
+            ki_barrier = 1.0 - (decline / 100.0)
+    result["ki_barrier"] = ki_barrier
+
+    # ── MEMORY COUPON ──
+    memory = bool(re.search(
+        r'(?:memory\s*(?:coupon|feature|interest)|coupon\s*memory)',
+        text_clean, re.IGNORECASE
+    ))
+    # Also check for explicit "no memory" or "without memory"
+    if re.search(r'(?:no|without|non)[- ]?memory', text_clean, re.IGNORECASE):
+        memory = False
+    result["memory"] = memory
+
+    # ── FIRST AUTOCALL OBSERVATION ──
+    first_ac = _find_pattern(text_clean, [
+        r'(?:first|earliest)\s*(?:autocall|call|redemption)\s*(?:date|observation)[:\s]*(?:the\s+)?(\w+)\s*observation',
+        r'(?:callable|redeemable)\s*(?:beginning|starting)\s*(?:on|from|after)\s*(?:the\s+)?(\w+)\s*observation',
+        r'(?:no\s*(?:autocall|call).*?(?:first|initial)\s*(\d+)\s*(?:observation|month|quarter))',
+    ], cast=str, default="1")
+
+    ordinal_map = {"first": 1, "second": 2, "third": 3, "fourth": 4,
+                   "fifth": 5, "sixth": 6, "1st": 1, "2nd": 2, "3rd": 3, "4th": 4}
+    if isinstance(first_ac, str):
+        first_ac = ordinal_map.get(first_ac.lower(), None) or _safe_float(first_ac, 1)
+    result["first_autocall_obs"] = int(first_ac) if first_ac else 1
+
+    # ── ESTIMATED VALUE ──
+    est_val = _find_pattern(text_clean, [
+        r'estimated value[^$]*?\$([\d,]+\.?\d*)\s*(?:per)',
+        r'estimated value[^$]*?\$([\d,]+\.?\d*)',
+        r'(?:we estimate|estimated|our estimate)[^$]*?\$([\d,]+\.?\d*)',
+    ], cast=float)
+    result["issuer_estimated_value"] = est_val
+
+    # ── NOTE ID ──
+    ticker = result.get("underlying", "UNK")
+    date_str = result.get("issue_date", "")
+    date_code = date_str[:7].replace("-", "") if date_str else str(int(time.time()))[-6:]
+    issuer_code = {"JPMorgan": "JP", "Goldman Sachs": "GS", "Morgan Stanley": "MS",
+                   "Citigroup": "CI", "HSBC": "HS", "Barclays": "BA", "BofA": "BO",
+                   "UBS": "UB", "Credit Suisse": "CS", "Wells Fargo": "WF", "RBC": "RB",
+                   }.get(result.get("issuer", ""), "XX")
+    result["note_id"] = f"{issuer_code}-{ticker}-{date_code}"
+
+    # ── Count fields found ──
+    key_fields = ["issuer", "underlying", "issue_date", "S0", "par", "maturity",
+                  "n_obs", "coupon_rate", "autocall_trigger", "coupon_barrier",
+                  "ki_barrier", "memory", "first_autocall_obs", "issuer_estimated_value"]
+    result["fields_found"] = sum(1 for k in key_fields
+                                 if result.get(k) is not None and result.get(k) != "")
+
+    return result
+
 
 def _safe_float(val, default=None):
     """Safely extract float from pandas row (handles NaN, None, empty)."""
@@ -525,7 +818,7 @@ with st.sidebar:
 
     mode = st.radio(
         "Mode",
-        ["📝 Manual Entry", "📁 Upload CSV", "📂 Load Existing Data"],
+        ["📄 Upload SEC PDFs", "📝 Manual Entry", "📁 Upload CSV", "📂 Load Existing Data"],
         index=0,
     )
 
@@ -561,7 +854,181 @@ tabs = st.tabs(["📝 Input & Evaluate", "📊 Results Dashboard", "🔬 Backtes
 # TAB 1: INPUT & EVALUATE
 # ═══════════════════════════════════════════════════════════════════
 with tabs[0]:
-    if mode == "📝 Manual Entry":
+    if mode == "📄 Upload SEC PDFs":
+        st.markdown("### Upload SEC 424B2 Filing PDFs")
+        st.markdown(
+            "Upload one or more 424B2 pricing supplement PDFs directly from SEC EDGAR. "
+            "The extractor will auto-detect term sheet parameters."
+        )
+
+        uploaded_pdfs = st.file_uploader(
+            "Drop SEC 424B2 PDF(s) here",
+            type=["pdf"],
+            accept_multiple_files=True,
+            help="Download 424B2 filings from https://efts.sec.gov/LATEST/search-index",
+        )
+
+        if uploaded_pdfs:
+            st.markdown(f"**{len(uploaded_pdfs)} PDF(s) uploaded**")
+
+            # ── Extract all PDFs ──
+            if "pdf_extractions" not in st.session_state:
+                st.session_state.pdf_extractions = []
+
+            if st.button("🔍 Extract Term Sheets", type="primary", use_container_width=True):
+                st.session_state.pdf_extractions = []
+                progress = st.progress(0, text="Extracting...")
+                for i, pdf_file in enumerate(uploaded_pdfs):
+                    progress.progress(
+                        (i + 1) / len(uploaded_pdfs),
+                        text=f"Extracting {pdf_file.name} ({i+1}/{len(uploaded_pdfs)})..."
+                    )
+                    pdf_bytes = pdf_file.read()
+                    extracted = extract_term_sheet_from_pdf(pdf_bytes, pdf_file.name)
+                    st.session_state.pdf_extractions.append(extracted)
+                progress.empty()
+                st.success(f"Extracted {len(uploaded_pdfs)} filing(s)!")
+
+            # ── Show extractions and allow editing ──
+            if st.session_state.get("pdf_extractions"):
+                for idx, ext in enumerate(st.session_state.pdf_extractions):
+                    confidence = ext["fields_found"] / ext["fields_total"] * 100
+
+                    if confidence >= 80:
+                        conf_color = "🟢"
+                        conf_label = "High"
+                    elif confidence >= 50:
+                        conf_color = "🟡"
+                        conf_label = "Medium"
+                    else:
+                        conf_color = "🔴"
+                        conf_label = "Low"
+
+                    with st.expander(
+                        f"{conf_color} {ext.get('note_id', f'PDF-{idx+1}')} | "
+                        f"{ext.get('underlying', '?')} | "
+                        f"{ext.get('issuer', '?')} | "
+                        f"Confidence: {conf_label} ({ext['fields_found']}/{ext['fields_total']} fields)",
+                        expanded=(idx == 0),
+                    ):
+                        if ext.get("warnings"):
+                            for w in ext["warnings"]:
+                                st.warning(w)
+
+                        st.markdown(f"**Source:** `{ext['source_file']}`")
+                        st.markdown("---")
+
+                        # Editable fields in columns
+                        c1, c2, c3 = st.columns(3)
+                        with c1:
+                            st.markdown("**Identifiers**")
+                            ext["note_id"] = st.text_input(
+                                "Note ID", value=ext.get("note_id", ""), key=f"pdf_nid_{idx}")
+                            ext["issuer"] = st.text_input(
+                                "Issuer", value=ext.get("issuer", ""), key=f"pdf_iss_{idx}")
+                            ext["underlying"] = st.text_input(
+                                "Underlying", value=ext.get("underlying", ""), key=f"pdf_und_{idx}")
+                            ext["issue_date"] = st.text_input(
+                                "Trade Date (YYYY-MM-DD)", value=ext.get("issue_date", ""), key=f"pdf_dt_{idx}")
+                            s0_val = ext.get("S0")
+                            ext["S0"] = st.number_input(
+                                "Initial Price (S0)", value=float(s0_val) if s0_val else 0.0,
+                                min_value=0.0, format="%.2f", key=f"pdf_s0_{idx}")
+
+                        with c2:
+                            st.markdown("**Structure**")
+                            par_val = ext.get("par", 1000.0)
+                            ext["par"] = st.number_input(
+                                "Par Value", value=float(par_val) if par_val else 1000.0,
+                                key=f"pdf_par_{idx}")
+                            mat_val = ext.get("maturity")
+                            ext["maturity"] = st.number_input(
+                                "Maturity (years)", value=float(mat_val) if mat_val else 2.0,
+                                min_value=0.25, max_value=10.0, step=0.25, key=f"pdf_mat_{idx}")
+                            nobs_val = ext.get("n_obs")
+                            ext["n_obs"] = st.number_input(
+                                "Observation Dates", value=int(nobs_val) if nobs_val else 8,
+                                min_value=1, max_value=60, key=f"pdf_nobs_{idx}")
+                            cr_val = ext.get("coupon_rate")
+                            ext["coupon_rate"] = st.number_input(
+                                "Coupon Rate (per period)", value=float(cr_val) if cr_val else 0.025,
+                                min_value=0.0, max_value=0.5, format="%.5f", key=f"pdf_cr_{idx}")
+                            ext["memory"] = st.checkbox(
+                                "Memory Coupon", value=ext.get("memory", True), key=f"pdf_mem_{idx}")
+
+                        with c3:
+                            st.markdown("**Barriers**")
+                            ac_val = ext.get("autocall_trigger", 1.0)
+                            ext["autocall_trigger"] = st.number_input(
+                                "Autocall Trigger (fraction)", value=float(ac_val) if ac_val else 1.0,
+                                min_value=0.5, max_value=1.5, format="%.2f", key=f"pdf_ac_{idx}")
+                            cb_val = ext.get("coupon_barrier")
+                            ext["coupon_barrier"] = st.number_input(
+                                "Coupon Barrier (fraction)", value=float(cb_val) if cb_val else 0.70,
+                                min_value=0.1, max_value=1.0, format="%.2f", key=f"pdf_cb_{idx}")
+                            ki_val = ext.get("ki_barrier")
+                            ext["ki_barrier"] = st.number_input(
+                                "Knock-In Barrier (fraction)", value=float(ki_val) if ki_val else 0.60,
+                                min_value=0.1, max_value=1.0, format="%.2f", key=f"pdf_ki_{idx}")
+                            fac_val = ext.get("first_autocall_obs", 1)
+                            ext["first_autocall_obs"] = st.number_input(
+                                "First Autocall Obs", value=int(fac_val) if fac_val else 1,
+                                min_value=1, max_value=20, key=f"pdf_fac_{idx}")
+                            ev_val = ext.get("issuer_estimated_value")
+                            ext["issuer_estimated_value"] = st.number_input(
+                                "Estimated Value ($)", value=float(ev_val) if ev_val else 0.0,
+                                min_value=0.0, format="%.2f", key=f"pdf_ev_{idx}")
+
+                st.markdown("---")
+
+                # Evaluate button for all extracted notes
+                valid_notes = [e for e in st.session_state.pdf_extractions
+                               if e.get("S0") and e.get("S0") > 0
+                               and e.get("underlying")]
+
+                if valid_notes:
+                    st.markdown(f"**{len(valid_notes)} note(s) ready for evaluation** "
+                                f"({len(st.session_state.pdf_extractions) - len(valid_notes)} incomplete)")
+
+                    if st.button("🚀 Evaluate All Extracted Notes", type="primary",
+                                 use_container_width=True):
+                        progress = st.progress(0, text="Evaluating...")
+                        for i, ext in enumerate(valid_notes):
+                            progress.progress(
+                                (i + 1) / len(valid_notes),
+                                text=f"Evaluating {ext['note_id']} ({i+1}/{len(valid_notes)})..."
+                            )
+                            result = evaluate_note(
+                                S0=float(ext["S0"]),
+                                par=float(ext.get("par", 1000.0)),
+                                maturity=float(ext.get("maturity", 2.0)),
+                                n_obs=int(ext.get("n_obs", 8)),
+                                coupon_rate=float(ext.get("coupon_rate", 0.025)),
+                                autocall_trigger=float(ext.get("autocall_trigger", 1.0)),
+                                coupon_barrier=float(ext.get("coupon_barrier", 0.70)),
+                                ki_barrier=float(ext.get("ki_barrier", 0.60)),
+                                memory=bool(ext.get("memory", True)),
+                                first_autocall_obs=int(ext.get("first_autocall_obs", 1)),
+                                risk_free_rate=0.045,
+                                atm_iv=0.30,
+                                div_yield=0.01,
+                                n_paths=n_paths, seed=seed + i,
+                                note_id=ext.get("note_id", f"PDF-{i+1}"),
+                                issuer=ext.get("issuer", ""),
+                                underlying=ext.get("underlying", ""),
+                                issuer_estimated_value=_safe_float(ext.get("issuer_estimated_value")),
+                                issue_date=ext.get("issue_date", ""),
+                            )
+                            st.session_state.evaluated_notes.append(result)
+                        progress.empty()
+                        st.success(f"All {len(valid_notes)} notes evaluated! "
+                                   f"Check the Results tab.")
+                        st.rerun()
+                else:
+                    st.warning("No notes have enough data to evaluate. "
+                               "Fill in at least Underlying and S0.")
+
+    elif mode == "📝 Manual Entry":
         st.markdown("### Enter Note Parameters")
 
         col1, col2, col3 = st.columns(3)
